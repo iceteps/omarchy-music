@@ -1,0 +1,246 @@
+#!/bin/bash
+# iceteps-music: the music web apps behind the iceteps.music Omarchy plugin.
+# https://github.com/iceteps/omarchy-music (MIT) by iceteps, https://github.com/iceteps
+#
+# Each platform runs as a Chromium app window in its OWN profile
+# (~/.local/share/iceteps-music/<id>). Chromium publishes one MPRIS player per
+# browser process, so a shared profile would merge every platform into a single
+# player; a profile each gives each platform its own process, its own player
+# (org.mpris.MediaPlayer2.chromium.instance<PID>) and its own login. The plugin
+# maps a player to its platform through that PID, read from `status`.
+#
+# Each app lives on its own hidden overlay, special:music-<id>, so showing one
+# never brings the others along. Hyprland places the window there as it starts
+# it (an exec rule), so no window rule and no edit of the user's config.
+# COUPLED: the platform ids below and PLATFORMS in ../MusicModel.js (same ids).
+
+set -euo pipefail
+
+readonly IDS=(spotify youtube apple)
+declare -Ar LABEL=([spotify]="Spotify" [youtube]="YouTube Music" [apple]="Apple Music")
+declare -Ar HOST=([spotify]="open.spotify.com" [youtube]="music.youtube.com" [apple]="music.apple.com")
+readonly SPECIAL_PREFIX="music-"
+readonly DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/iceteps-music"
+readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/iceteps-music"
+readonly CHROMIUM_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/chromium"
+readonly BROWSER="chromium"
+
+usage() {
+  cat <<'EOF'
+Usage: iceteps-music <command> [platform]
+
+  status               JSON: platforms, which run, their PIDs, which is shown
+  launch <id> [--show] start a platform (no-op if running); --show reveals it
+  stop <id> [reason]   close a platform's app and its browser process
+  log                  the last starts and stops, with their reasons
+  remember <id> <json> keep a service's last track (title, artist, album,
+                       art, position, length) to show while it is closed
+  show [id]            reveal that platform's app (default: the last started)
+  hide                 park whichever music app is shown
+  toggle [id]          show, or hide when a music app is already shown
+
+Platforms: spotify, youtube, apple
+EOF
+}
+
+die() { echo "iceteps-music: $*" >&2; exit 1; }
+
+# A string as a Lua literal, for `hyprctl eval`.
+lua_string() {
+  local s=${1//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '"%s"' "$s"
+}
+
+require_id() {
+  [[ -n ${1:-} && -n ${HOST[$1]+x} ]] || die "unknown platform '${1:-}' (spotify|youtube|apple)"
+}
+
+# PID of the platform's own browser process, or nothing. A window of the same
+# host opened from the everyday browser profile does not count: only a process
+# started with this platform's --user-data-dir is ours to report or stop.
+platform_pid() {
+  local id=$1 class pid args
+  class="^chrome-${HOST[$id]//./\\.}_"
+  while read -r pid; do
+    [[ -n $pid && -r /proc/$pid/cmdline ]] || continue
+    # Chromium rewrites its main process title into one space-joined string,
+    # so match the flag as a space-delimited word, not as its own argv entry.
+    args=" $(tr '\0' ' ' <"/proc/$pid/cmdline") "
+    if [[ $args == *" --user-data-dir=$DATA_DIR/$id "* ]]; then
+      echo "$pid"
+      return
+    fi
+  done < <(hyprctl clients -j | jq -r --arg c "$class" '.[] | select(.class | test($c)) | .pid')
+}
+
+# The platform whose overlay is open on the focused monitor, or nothing.
+shown_id() {
+  hyprctl monitors -j | jq -r --arg p "special:$SPECIAL_PREFIX" \
+    '.[] | select(.focused) | .specialWorkspace.name // "" | select(startswith($p)) | ltrimstr($p)'
+}
+
+toggle_special() {
+  hyprctl dispatch "hl.dsp.workspace.toggle_special($(lua_string "$SPECIAL_PREFIX$1"))" >/dev/null
+}
+
+last_id() {
+  local id
+  [[ -r $STATE_DIR/last ]] && id=$(<"$STATE_DIR/last")
+  [[ -n ${id:-} && -n ${HOST[$id]+x} ]] && echo "$id" || echo "${IDS[0]}"
+}
+
+# Showing another platform's overlay replaces the open one.
+show() {
+  local id=${1:-$(last_id)}
+  [[ $(shown_id) == "$id" ]] || toggle_special "$id"
+}
+
+hide() {
+  local id
+  id=$(shown_id)
+  [[ -z $id ]] || toggle_special "$id"
+  # The plugin binds plain Esc to `hide` while an app is shown; drop it here too,
+  # so Esc is never left captured if the shell is not running.
+  hyprctl eval 'hl.unbind("ESCAPE")' >/dev/null
+}
+
+status() {
+  local id pid last="" shown specials last_track rows=()
+  [[ -r $STATE_DIR/last ]] && last=$(<"$STATE_DIR/last")
+  shown=$(shown_id)
+  # Special workspace per monitor, so the plugin knows an app is on screen on
+  # any monitor, not only the focused one.
+  specials=$(hyprctl monitors -j | jq -c 'map({(.name): (.specialWorkspace.name // "")}) | add // {}')
+  for id in "${IDS[@]}"; do
+    pid=$(platform_pid "$id")
+    # A missing or damaged file is no last track, never a failed status.
+    last_track=$(jq -c . "$STATE_DIR/last-$id.json" 2>/dev/null) || last_track=null
+    [[ -n $last_track ]] || last_track=null
+    rows+=("$(jq -cn --arg id "$id" --arg label "${LABEL[$id]}" --arg pid "$pid" \
+      --argjson last "$last_track" \
+      '{id: $id, label: $label, running: ($pid != ""),
+        pid: (if $pid == "" then 0 else ($pid | tonumber) end),
+        lastTrack: $last}')")
+  done
+  printf '%s\n' "${rows[@]}" | jq -cs --arg shown "$shown" --arg last "$last" \
+    --argjson specials "$specials" '{shown: $shown, last: $last, specials: $specials, platforms: .}'
+}
+
+# A new profile has no Widevine (the DRM module Spotify and Apple Music need).
+# Chromium fetches it a minute after start but loads it only on the NEXT start,
+# so the first session cannot play (seen 2026-10-29). Seed it from the everyday
+# profile instead, pointing the "latest" hint at the copy.
+seed_widevine() {
+  local dir=$DATA_DIR/$1/WidevineCdm src=$CHROMIUM_DIR/WidevineCdm version
+  [[ -d $dir || ! -r $src/latest-component-updated-widevine-cdm ]] && return 0
+  version=$(jq -r '.Path // empty' "$src/latest-component-updated-widevine-cdm" 2>/dev/null) || return 0
+  version=${version##*/}
+  [[ -n $version && -d $src/$version ]] || return 0
+  mkdir -p "$dir"
+  cp -a "$src/$version" "$dir/"
+  jq -cn --arg p "$dir/$version" '{Path: $p}' >"$dir/latest-component-updated-widevine-cdm"
+}
+
+launch() {
+  local id=$1 reveal=${2:-} i
+  mkdir -p "$STATE_DIR"
+  echo "$id" >"$STATE_DIR/last"
+  if [[ -z $(platform_pid "$id") ]]; then
+    command -v "$BROWSER" >/dev/null || die "$BROWSER is required"
+    note "launch $id"
+    seed_widevine "$id"
+    # Hyprland runs it, so it is detached from this script and from the shell
+    # plugin, and the exec rule parks its window on the overlay as it maps.
+    local cmd
+    cmd=$(printf '%q ' "$BROWSER" "--app=https://${HOST[$id]}/" "--user-data-dir=$DATA_DIR/$id")
+    hyprctl eval "hl.exec_cmd($(lua_string "$cmd"), { workspace = $(lua_string "special:$SPECIAL_PREFIX$id silent") })" \
+      >/dev/null
+    if [[ $reveal == --show ]]; then
+      # Wait for the window so the reveal shows the app, not an empty overlay.
+      for i in {1..40}; do
+        [[ -n $(platform_pid "$id") ]] && break
+        sleep 0.25
+      done
+    fi
+  fi
+  [[ $reveal == --show ]] && show "$id"
+  return 0
+}
+
+# Every start and stop, with who asked and why, so "it closed by itself" can
+# be answered. Kept to the last 200 lines.
+note() {
+  local file=$STATE_DIR/log
+  mkdir -p "$STATE_DIR"
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$file"
+  if (($(wc -l <"$file") > 200)); then
+    tail -n 200 "$file" >"$file.tmp" && mv "$file.tmp" "$file"
+  fi
+}
+
+# The last track of a service, kept while it is closed so its tab can show
+# where you left off. The cover is copied: Chromium's art file is a temp file
+# that goes with the browser.
+remember() {
+  local id=$1 json=$2 art cover="" at title
+  title=$(jq -r '.title // "" | tostring' <<<"$json" 2>/dev/null) || return 0
+  # Nothing to keep: never overwrite a saved track with an empty one.
+  [[ -n $title ]] || return 0
+  mkdir -p "$STATE_DIR"
+  art=$(jq -r '.art // "" | tostring' <<<"$json" 2>/dev/null) || return 0
+  art=${art#file://}
+  at=$(date +%s)
+  # Only Chromium's own temp art file (it fetched the artwork itself), and only
+  # an image: never an arbitrary local file.
+  if [[ $art == /tmp/.org.chromium.Chromium.* && -f $art && -r $art ]] \
+    && file -b --mime-type -- "$art" | grep -q '^image/'; then
+    # A new name per track: the shell caches images by path.
+    rm -f -- "$STATE_DIR/cover-$id-"*
+    cover=$STATE_DIR/cover-$id-$at
+    cp -f -- "$art" "$cover"
+  elif [[ -r $STATE_DIR/last-$id.json ]] \
+    && [[ $(jq -r '.title // ""' "$STATE_DIR/last-$id.json" 2>/dev/null) == "$title" ]]; then
+    # Same track, no art this time (the browser already gone): keep its cover.
+    cover=$(jq -r '.cover // ""' "$STATE_DIR/last-$id.json" 2>/dev/null) || cover=""
+    [[ -f $cover ]] || cover=""
+  fi
+  note "remember $id: $title"
+  jq -c --arg cover "$cover" --arg at "$at" \
+    '{title: (.title // "" | tostring), artist: (.artist // "" | tostring),
+      album: (.album // "" | tostring), position: (.position // 0 | tonumber? // 0),
+      length: (.length // 0 | tonumber? // 0), cover: $cover, at: ($at | tonumber)}' \
+    <<<"$json" >"$STATE_DIR/last-$id.json.tmp" 2>/dev/null \
+    && mv "$STATE_DIR/last-$id.json.tmp" "$STATE_DIR/last-$id.json"
+  return 0
+}
+
+stop() {
+  local id=$1 reason=${2:-command line} pid i
+  pid=$(platform_pid "$id")
+  [[ -z $pid ]] && return 0
+  note "stop $id ($reason)"
+  kill "$pid" 2>/dev/null || return 0
+  # Return once the window is gone, so a `status` right after reports it stopped.
+  for i in {1..40}; do
+    [[ -z $(platform_pid "$id") ]] && break
+    sleep 0.1
+  done
+  return 0
+}
+
+case ${1:-} in
+status) status ;;
+launch) require_id "${2:-}"; launch "$2" "${3:-}" ;;
+stop) require_id "${2:-}"; stop "$2" "${3:-}" ;;
+log) cat "$STATE_DIR/log" 2>/dev/null || true ;;
+remember) require_id "${2:-}"; remember "$2" "${3:-{\}}" ;;
+show) [[ -z ${2:-} ]] || require_id "$2"; show "${2:-}" ;;
+hide) hide ;;
+toggle)
+  [[ -z ${2:-} ]] || require_id "$2"
+  if [[ -n $(shown_id) ]]; then hide; else show "${2:-}"; fi
+  ;;
+-h | --help | help) usage ;;
+*) usage >&2; exit 2 ;;
+esac

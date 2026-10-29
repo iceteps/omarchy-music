@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "iceteps.music",
+  "name": "Music",
+  "version": "1.0.0",
+  "author": "iceteps",
+  "description": "Spotify, YouTube Music and Apple Music from the bar: now playing, controls, and the apps parked on a hidden overlay",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Music",
+    "description": "Now playing and controls for the music web apps",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  },
+  "license": "MIT"
+}
